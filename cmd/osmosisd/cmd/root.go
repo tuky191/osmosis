@@ -3,6 +3,7 @@ package cmd
 import (
 	// "fmt"
 
+	"bytes"
 	"embed"
 	"encoding/json"
 	"fmt"
@@ -15,6 +16,8 @@ import (
 	"time"
 
 	rosettaCmd "cosmossdk.io/tools/rosetta/cmd"
+	txtypes "github.com/cosmos/cosmos-sdk/types/tx"
+	"github.com/gorilla/mux"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/spf13/viper"
 
@@ -28,6 +31,7 @@ import (
 	tmcli "github.com/cometbft/cometbft/libs/cli"
 	"github.com/cometbft/cometbft/libs/log"
 	tmtypes "github.com/cometbft/cometbft/types"
+	authtx "github.com/cosmos/cosmos-sdk/x/auth/tx"
 	"github.com/spf13/cast"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
@@ -659,13 +663,109 @@ func queryCommand() *cobra.Command {
 		rpc.ValidatorCommand(),
 		rpc.BlockCommand(),
 		authcmd.QueryTxsByEventsCmd(),
-		authcmd.QueryTxCmd(),
+		QueryTxCmd(),
+		QueryTxCmdServer(),
 	)
 
 	osmosis.ModuleBasics.AddQueryCommands(cmd)
 	cmd.PersistentFlags().String(flags.FlagChainID, "", "The network chain ID")
 
 	return cmd
+}
+
+func QueryTxCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "tx hash",
+		Short: "Query for a transaction by hash",
+		Long:  "",
+		Args:  cobra.ExactArgs(1),
+		RunE:  queryTx,
+	}
+
+	flags.AddQueryFlagsToCmd(cmd)
+
+	return cmd
+}
+
+func QueryTxCmdServer() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "start-api",
+		Short: "Start API server for transaction query",
+		Long:  "",
+		Args:  cobra.NoArgs,
+		RunE:  queryTx,
+	}
+
+	flags.AddQueryFlagsToCmd(cmd)
+
+	return cmd
+}
+
+func queryTx(cmd *cobra.Command, args []string) error {
+	clientCtx, err := client.GetClientQueryContext(cmd)
+	if err != nil {
+		return err
+	}
+
+	if len(args) > 0 {
+		clientCtx.Output = os.Stdout
+
+		if args[0] == "" {
+			return fmt.Errorf("argument should be a tx hash")
+		}
+		txResult, err := getTx(clientCtx, args[0])
+		if err != nil {
+			return err
+		}
+		return clientCtx.PrintProto(txResult)
+	}
+	r := mux.NewRouter()
+	r.HandleFunc("/cosmos/tx/v1beta1/txs/{hash}", func(w http.ResponseWriter, r *http.Request) {
+		buffer := new(bytes.Buffer)
+		clientCtx.Output = buffer
+
+		vars := mux.Vars(r)
+		txHash := vars["hash"]
+		txResult, err := getTx(clientCtx, txHash)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		if err := clientCtx.PrintProto(txResult); err != nil {
+			http.Error(w, "Failed to serialize response", http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, err = w.Write(buffer.Bytes())
+		if err != nil {
+			http.Error(w, "Failed to write response", http.StatusInternalServerError)
+		}
+	})
+
+	fmt.Println("Starting API server on port 1317...")
+	if err := http.ListenAndServe(":1317", r); err != nil {
+		return fmt.Errorf("Error starting server: %s", err)
+	}
+	return nil
+}
+
+func getTx(clientCtx client.Context, txhash string) (*txtypes.GetTxResponse, error) {
+	result, err := authtx.QueryTx(clientCtx, txhash)
+	if err != nil {
+		return nil, err
+	}
+	if result.Empty() {
+		return nil, fmt.Errorf("tx not found %s", txhash)
+	}
+	protoTx, ok := result.Tx.GetCachedValue().(*txtypes.Tx)
+	if !ok {
+		return nil, fmt.Errorf("expected %T, got %T", txtypes.Tx{}, result.Tx.GetCachedValue())
+	}
+	return &txtypes.GetTxResponse{
+		Tx:         protoTx,
+		TxResponse: result,
+	}, nil
 }
 
 // txCommand adds transaction signing, encoding / decoding, and broadcasting commands.
