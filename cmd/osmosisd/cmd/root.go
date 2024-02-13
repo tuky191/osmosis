@@ -3,15 +3,18 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/cosmos/cosmos-sdk/x/crisis"
 	"github.com/gorilla/mux"
 	"github.com/osmosis-labs/osmosis/app/params"
+	"google.golang.org/grpc/codes"
 
 	"github.com/cosmos/cosmos-sdk/baseapp"
 	"github.com/cosmos/cosmos-sdk/client"
@@ -184,6 +187,12 @@ func QueryTxCmdServer() *cobra.Command {
 	return cmd
 }
 
+type notFoundError struct {
+	Message string     `json:"message"`
+	Code    codes.Code `json:"code"`
+	Details []string   `json:"details"`
+}
+
 func queryTx(cmd *cobra.Command, args []string) error {
 	clientCtx, err := client.GetClientQueryContext(cmd)
 	if err != nil {
@@ -210,6 +219,24 @@ func queryTx(cmd *cobra.Command, args []string) error {
 		vars := mux.Vars(r)
 		txHash := vars["hash"]
 		txResult, err := getTx(clientCtx, txHash)
+
+		if err != nil {
+			if strings.Contains(err.Error(), "not found") {
+				notFound := notFoundError{
+					Message: fmt.Sprintf("tx not found: %s", txHash),
+					Code:    codes.NotFound,
+					Details: []string{err.Error()},
+				}
+				notFoundJson, _ := json.Marshal(notFound)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = w.Write(notFoundJson)
+				return
+			}
+
+			return
+		}
+
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusNotFound)
 			return
